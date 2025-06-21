@@ -1,27 +1,31 @@
 import asyncio
 from enum import Enum
-import os
 from pathlib import Path
-import time
-from typing import List, Tuple
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.remote.webelement import WebElement 
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import Select
-from selenium.common.exceptions import NoSuchElementException
-
 from random import choice, sample, choices
+from typing import List
+
+import parsel
+from playwright.async_api import async_playwright, Page, Locator, ElementHandle
+
 from solver import LostException, MinesweeperSolver, WinException
 
+
 class GameLevel(Enum):
-    BEGINNER = 0
-    EASY = 1
-    ADVANCED = 2
-    EXPERT = 3
+    BEGINNER = 1
+    EASY = 2
+    ADVANCED = 3
+    EXPERT = 4
+
+    def __str__(self):
+        return self.name.lower()
+
+    @staticmethod
+    def from_string(s: str):
+        try:
+            return GameLevel[s.upper()]
+        except KeyError:
+            raise ValueError()
+
 
 GAME_LEVEL_SIZE = {
     GameLevel.BEGINNER: (8, 8),
@@ -38,194 +42,185 @@ GAME_LEVEL_MINES = {
 }
 
 
-
 class MineSweeperPlayer:
-    URL: str = 'https://saper-online.pl/gra.php'
+    URL = "https://saper-online.pl/gra.php"
 
-    def __init__(self, game_level: GameLevel = GameLevel.BEGINNER, nick: str = "Melzak", wins: int = 5) -> None:
+    def __init__(
+        self,
+        game_level=GameLevel.BEGINNER,
+        nick="Melzak",
+        wins=5,
+        headless=False,
+        loss_treshold=10,
+    ):
         self.game_level = game_level
         self.nick = nick
         self.wins = wins
-        self.driver: webdriver.Chrome = None
-        self.game: WebElement = None
-        self.panels: WebElement = None
-
+        self.headless = headless
+        self.loss_treshold = 10
+        self.page: Page = None
         self.solver: MinesweeperSolver = None
 
+    async def setup_game(self, page: Page):
+        self.page = page
+        await page.goto(self.URL)
 
-    def connect(self):
-        ser = Service(executable_path="chromedriver-win64/chromedriver.exe")
-        options = Options()
-        options.add_argument("--no-sandbox")
-        options.add_argument("--no-first-run")
-        options.add_argument("--no-default-browser-check")
-
-        # Disable info bars like "Chrome is being controlled by automated test software"
-        options.add_argument("--disable-infobars")
-
-        # Optional: Disable notifications (e.g., requests to show notifications)
-        options.add_argument("--disable-notifications")
-        options.add_argument("--disable-search-engine-choice-screen")
-        
-        # options.add_argument("--headless")
-        self.driver = webdriver.Chrome(options=options, service=ser)
-        self.driver.get('https://saper-online.pl/gra.php')
-        
-
-        
-    def log_request(self, intercepted_request):
-        print(f"URL: {intercepted_request.get('request').get('url')}")
-    
-    def game_setup(self):
-        self.connect()
-        
         try:
-            button = self.driver.find_element(By.CLASS_NAME, "fc-cta-consent")
-            button.click()
-        except NoSuchElementException:
-            pass
-        
-        self.set_login()
-        self.select_level()
-        self.click_cookies()
-        self.game = self.driver.find_element(By.ID, "Gra")
-        board = self.to_board()
-        self.solver = MinesweeperSolver(board, GAME_LEVEL_SIZE[self.game_level], self.driver, GAME_LEVEL_MINES[self.game_level])
+            el = await page.wait_for_selector(".fc-button", timeout=5000)
+            await el.click()
+        except Exception as e:
+            print(f"Nie udało się zaakceptować ciasteczek: {e}")
 
-    def select_level(self):
-        select = Select(self.driver.find_element(By.ID, "poziomValue"))
-        select.select_by_index(self.game_level.value)
-        self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.F2)
-        self.driver.implicitly_wait(1)
+        try:
+            await page.wait_for_selector("#cookieBox", timeout=5000)
+            await page.locator(".button.blue", has_text="Rozumiem, akceptuję!").click(
+                timeout=2000
+            )
+        except Exception as e:
+            print(f"Nie udało się zaakceptować ciasteczek: {e}")
 
-    def set_login(self):
-        self.driver.implicitly_wait(1)
-        divNick = self.driver.find_element(By.ID, "divNick")
-        divNick.find_element(By.XPATH,"// span[contains(text(), 'Zmień nazwę')]").click()
-        self.driver.implicitly_wait(1)
-        login = divNick.find_element(By.ID, "login")
-        login.send_keys(Keys.BACKSPACE * 10)
-        login.send_keys(self.nick)
-        divNick.find_element(By.XPATH,"// span[contains(text(), 'Zmień')]").click()
-        self.driver.implicitly_wait(1)
+        try:
+            await page.locator(".button.green", has_text="Zmień nazwę").click()
+            login_input = await page.wait_for_selector("#login")
+            await login_input.fill("")
+            await login_input.fill(self.nick)
+            await page.locator(".button.blue", has_text="Zmień").click()
+        except Exception as e:
+            print(f"Nie udało się zmienić nazwy: {e}")
 
-    def to_board(self):
-        board: List[List[WebElement]] = []    
+        await page.select_option("#poziomValue", str(self.game_level.value))
+        await page.keyboard.press("F2")
+
+        await asyncio.sleep(1)  # czekaj aż plansza się załaduje
+
+        board = await self.to_board(page)
+        self.solver = MinesweeperSolver(
+            board,
+            GAME_LEVEL_SIZE[self.game_level],
+            self.page,
+            GAME_LEVEL_MINES[self.game_level],
+        )
+
+    async def to_board(self, page: Page) -> List[List[Locator]]:
+        game = page.locator("#Gra")
+        board = []
         rows, cols = GAME_LEVEL_SIZE[self.game_level]
 
         for row in range(rows):
-            board.append([])
+            row_elements = []
             for col in range(cols):
-                panel = self.game.find_element(By.ID, f"{row}-{col}")  
-                board[row].append(panel)
-        
+                cell = game.locator(f'[id="{row}-{col}"]')
+                row_elements.append(cell)
+            board.append(row_elements)
+
         return board
-    
-    def get_time_info(self):
-        czas_info = self.driver.find_element(By.ID, "CzasInfo")
-        return czas_info.text
 
-    def new_game(self):
-        el = self.driver.find_element(By.TAG_NAME, "body")
-        el.send_keys(Keys.F2)
-    
-        self.game = self.driver.find_element(By.ID, "Gra")
-        board = self.to_board()
-        self.solver = MinesweeperSolver(board, GAME_LEVEL_SIZE[self.game_level], self.driver, GAME_LEVEL_MINES[self.game_level])
-   
+    async def get_time_info(self):
+        czas = await self.page.query_selector("#CzasInfo")
+        return await czas.inner_text()
 
-    def click_cookies(self):
-        self.driver.find_element(By.XPATH,"// span[contains(text(), 'Rozumiem, akceptuję!')]").click()
+    async def new_game(self):
+        await self.page.keyboard.press("F2")
+        board = await self.to_board(self.page)
+        self.solver = MinesweeperSolver(
+            board,
+            GAME_LEVEL_SIZE[self.game_level],
+            self.page,
+            GAME_LEVEL_MINES[self.game_level],
+        )
 
-    def get_optimal_random_moves(self):
-        rows, cols = GAME_LEVEL_SIZE[self.game_level]
-        mines = GAME_LEVEL_MINES[self.game_level]
-        return int(rows * cols / mines)
-    
-    async def solve(self):
-        condition = True
-        threshold = 70
-        self.game_setup()
-        loses = 0
-        while condition:
-            try:
-                r, c = GAME_LEVEL_SIZE[self.game_level]
-                self.solver.click(r // 2 - 1, c // 2 - 1)
-                # n = self.get_optimal_random_moves()
-                self.random_moves(3)
-
-                while True:
-                    await self.solver.update_board()
-                    moves = self.solver.find_safe_moves()
-
-                    if moves:
-                        for r, c in moves:
-                            self.solver.click(r, c)
-                        continue
-                    
-                    moves = self.solver.find_safe_moves()
-
-                    if moves:
-                        for r, c in moves:
-                            self.solver.click(r, c)
-                        continue
-                    
-                            
-                    moves = self.solver.probability()
-                    if not moves:
-                        time_info = self.get_time_info()
-                        raise WinException(f"Wygrana w {time_info}s")
-
-                    r, c = choice(moves)
-                    
-                    self.solver.click(r, c)
-
-                    
-
-            except WinException as win:
-                print(win)
-                time_info = float(self.get_time_info())
-                if time_info < threshold:
-                    self.wins -= 1
-                    condition = self.wins > 0
-                self.new_game()
-            except LostException as e:
-                time_info = self.get_time_info()
-                print(f"Przegrałem w {time_info}")
-
-                if float(time_info) > 2.0:
-                    if not (d := Path("loses")).is_dir():
-                        d.mkdir()
-                        
-                    self.solver.save_state(f"loses/lose_{loses}.txt")
-                    loses += 1
-                self.new_game()
-
-            except Exception as e:
-                print(e)
-                           
-
-        self.driver.close()
-
-    def random_moves(self, n: int = 5):
+    async def random_moves(self, n: int = 5):
         moves = self.solver.get_unmarked()
-        
         if len(moves) < n:
-            r, c = choices(moves)
-            
-            self.solver.click(r, c)
+            r, c = choices(moves)[0]
+            await self.solver.click(r, c, self.page)
         else:
-            chosen = sample(moves, n)
-            for r, c in chosen:
-                self.solver.click(r, c)
+            for r, c in sample(moves, n):
+                await self.solver.click(r, c, self.page)
+
+    async def solve(self):
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=False)
+            context = await browser.new_context()
+            page = await context.new_page()
+
+            await self.setup_game(page)
+            loses = 0
+
+            while self.wins > 0:
+                try:
+                    r, c = GAME_LEVEL_SIZE[self.game_level]
+                    await self.solver.click(r // 2 - 1, c // 2 - 1, page)
+                    await self.random_moves(3)
+                    while True:
+                        await self.solver.update_board(page)
+                        moves = self.solver.find_safe_moves()
+                        if moves:
+                            for r, c in moves:
+                                await self.solver.click(r, c, page)
+                            continue
+
+                        moves = self.solver.probability()
+                        if not moves:
+                            time_info = await self.get_time_info()
+                            raise WinException(f"Wygrana w {time_info}s")
+
+                        r, c = choice(moves)
+                        await self.solver.click(r, c, page)
+
+                except WinException as win:
+                    print(win)
+                    czas = float(await self.get_time_info())
+                    self.wins -= 1
+                    await self.new_game()
+
+                except LostException:
+                    czas = await self.get_time_info()
+                    print(f"Przegrana w {czas}")
+                    if float(czas) > 2.0:
+                        Path("loses").mkdir(exist_ok=True)
+                        self.solver.save_state(f"loses/lose_{loses}.txt")
+                        loses += 1
+                    await self.new_game()
+
+                except Exception as e:
+                    print(f"Błąd: {e}")
+                    break
+
+            await browser.close()
 
 
-            
+def argparse_args():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="MineSweeper Player")
+    parser.add_argument(
+        "--level",
+        type=GameLevel.from_string,
+        default=GameLevel.BEGINNER,
+        choices=list(GameLevel),
+        help="Game level to play",
+    )
+    parser.add_argument("--nick", type=str, default="Melzak", help="Player nickname")
+    parser.add_argument(
+        "--wins", type=int, default=10, help="Number of wins to achieve"
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run the browser in headless mode (default is False)",
+    )
+
+    return parser.parse_args()
+
 
 async def main():
-    player = MineSweeperPlayer(game_level=GameLevel.EXPERT, nick="Melzak", wins=10)
-
+    args = argparse_args()
+    player = MineSweeperPlayer(
+        game_level=args.level, nick=args.nick, wins=args.wins, headless=args.headless
+    )
     await player.solve()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
